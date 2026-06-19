@@ -6,7 +6,8 @@ $AppList = @(
     "7zip.7zip",
     "Google.Chrome",
     "Mozilla.Firefox",
-    "ChemTableSoftware.RegOrganizer"
+    "ChemTableSoftware.RegOrganizer",
+    "Intel.IntelDriverAndSupportAssistant"
 )
 
 Write-Host "Starting Batch Deployment..." -ForegroundColor Green
