@@ -1,1 +1,20 @@
-IyByZXN0b3Jl-aWNvbi5wczEgLSBSZWJ1aWxkIFdpbmRvd3MgaWNvbiBjYWNoZSB0byByZXN0b3JlIGRlZmF1bHQgYXBwIGljb25zCiMgVXNhZ2U6IGlybSBodHRwczovL2thaGFvODQuZ2l0aHViLmlvL3NjcmlwdHMvcmVzdG9yZWljb24ucHMxIHwgaWV4CiMgU2FmZSB0byBydW4gYXMgY3VycmVudCB1c2VyIChubyBhZG1pbiByZXF1aXJlZCk7IEV4cGxvcmVyIHdpbGwgYnJpZWZseSByZXN0YXJ0LgoKV3JpdGUtSG9zdCAiU3RvcHBpbmcgRXhwbG9yZXIuLi4iIC1Gb3JlZ3JvdW5kQ29sb3IgQ3lhbgpTdG9wLVByb2Nlc3MgLU5hbWUgZXhwbG9yZXIgLUZvcmNlIC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlClN0YXJ0LVNsZWVwIC1TZWNvbmRzIDIKCiRsb2NhbCA9ICRlbnY6TE9DQUxBUFBEQVRBCiRwYXRocyA9IEAKICAgICJcJGxvY2FsXEljb25DYWNoZS5kYiIsCiAgICAiXGxvY2FsXE1pY3Jvc29mdFxXaW5kb3dzXEV4cGxvcmVyXGljb25jYWNoZSoiLAogICAgIlxGxvY2FsXE1pY3Jvc29mdFxXaW5kb3dzXEV4cGxvcmVyXHRodW1iY2FjaGUqIgopCmZvcmVhY2ggKCRwIGluICRwYXRocykgewogICAgUmVtb3ZlLUl0ZW0gJHAgLUZvcmNlIC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlCn0KClN0YXJ0LVByb2Nlc3MgZXhwbG9yZXIuZXhlCldyaXRlLUhvc3QgIkRvbmUuIElmIHNvbWUgaWNvbnMgc3RpbGwgbG9vayB3cm9uZywgcmVib290IG9uY2UuIiAtRm9yZWdyb3VuZENvbG9yIEdyZWVuCg==
+# restoreicon.ps1 - Rebuild Windows icon cache to restore default app icons
+# Usage: irm https://kahao84.github.io/scripts/restoreicon.ps1 | iex
+# Safe to run as current user (no admin required); Explorer will briefly restart.
+
+Write-Host "Stopping Explorer..." -ForegroundColor Cyan
+Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
+$local = $env:LOCALAPPDATA
+$paths = @(
+    "$local\IconCache.db",
+    "$local\Microsoft\Windows\Explorer\iconcache*",
+    "$local\Microsoft\Windows\Explorer\thumbcache*"
+)
+foreach ($p in $paths) {
+    Remove-Item $p -Force -ErrorAction SilentlyContinue
+}
+
+Start-Process explorer.exe
+Write-Host "Done. If some icons still look wrong, reboot once." -ForegroundColor Green
