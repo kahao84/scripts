@@ -13,6 +13,9 @@
              wuauserv  - Windows Update
              bits      - Background Intelligent Transfer Service
              cryptsvc  - Cryptographic Services
+           plus two services that often hold the cache files open:
+             TrustedInstaller - Windows Modules Installer
+             UsoSvc           - Update Orchestrator Service
 
         2. Deletes the "dead" cache files (folder CONTENTS only - the
            folders themselves are kept, Windows refills them):
@@ -34,13 +37,22 @@
     to a minimum - locked files are counted and reported as one summary
     line at the end instead of one warning per file.
 
-    The script NEVER restarts the computer. If some files were locked
-    and could not be deleted, restart manually and run it once more.
+    If a file or folder STILL cannot be deleted (locked by a protected
+    service or a stubborn handle), it is queued for deletion at the next
+    reboot instead (PendingFileRenameOperations): Windows deletes it
+    early in the boot process, before the update services start, so it
+    cannot be locked again. The summary at the end tells you when a
+    reboot is needed to finish the cleanup.
+
+    The script NEVER restarts the computer. If files were queued for
+    deletion at the next reboot, restart manually once - no need to run
+    the script again afterwards.
 
 .NOTES
     Author  : Brian Lee (kahao84)
-    Version : 1.1 - 2026-10-23 (force-stop services immediately;
-              minimized warning output)
+    Version : 1.2 - 2026-10-23 (also stop TrustedInstaller / UsoSvc;
+              files that stay locked are queued for deletion at the
+              next reboot)
     Requires: Windows 10 / 11, Windows PowerShell 5.1+,
               Administrator rights (re-launches itself elevated if needed).
 
@@ -66,6 +78,34 @@ $wuServices = @(
     @{ Name = 'bits';     Label = 'Background Intelligent Transfer Service' }
     @{ Name = 'cryptsvc'; Label = 'Cryptographic Services' }
 )
+
+# Not part of Windows Update itself, but they often hold the cache files
+# open - stopped for the cleanup, started again afterwards.
+$holderServices = @(
+    @{ Name = 'TrustedInstaller'; Label = 'Windows Modules Installer' }
+    @{ Name = 'UsoSvc';           Label = 'Update Orchestrator Service' }
+)
+
+# --- Delete-on-reboot support (PendingFileRenameOperations) -------------------
+if (-not ([System.Management.Automation.PSTypeName]'Win32.MoveFile').Type) {
+    Add-Type -Namespace Win32 -Name MoveFile -MemberDefinition @'
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+'@
+}
+
+function Register-DeleteOnReboot {
+    param([string]$Path)
+    $queued = 0
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue) {
+            $queued += Register-DeleteOnReboot -Path $child.FullName
+        }
+    }
+    # MOVEFILE_DELAY_UNTIL_REBOOT = 4; a null new name means "delete".
+    if ([Win32.MoveFile]::MoveFileEx($Path, $null, 4)) { $queued++ }
+    return $queued
+}
 
 function Stop-WuService {
     param([string]$Name, [string]$Label)
@@ -129,41 +169,50 @@ function Start-WuService {
 
 function Clear-FolderContents {
     param([string]$Path, [string]$Label)
+    $result = [PSCustomObject]@{ Removed = 0; Queued = 0; Failed = 0 }
     if (-not (Test-Path -LiteralPath $Path)) {
         Write-Host "  $Label : folder not found ($Path) - skipped."
-        return 0
+        return $result
     }
     $items = Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (-not $items) {
         Write-Host "  $Label : already empty."
-        return 0
+        return $result
     }
-    $removed = 0
-    $failed  = 0
     foreach ($item in $items) {
         try {
             Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
-            $removed++
+            $result.Removed++
         } catch {
-            $failed++   # locked files are counted silently; one summary line at the end
+            # Still locked: queue it for deletion at the next reboot, when
+            # Windows removes it before the update services can start.
+            $q = Register-DeleteOnReboot -Path $item.FullName
+            if ($q -gt 0) { $result.Queued++ } else { $result.Failed++ }
         }
     }
-    Write-Host "  $Label : removed $removed item(s) from $Path"
-    return $failed
+    $line = "  $Label : removed $($result.Removed) item(s) from $Path"
+    if ($result.Queued -gt 0) { $line += " ; $($result.Queued) item(s) queued for deletion at next reboot" }
+    if ($result.Failed -gt 0) { $line += " ; $($result.Failed) item(s) FAILED" }
+    Write-Host $line
+    return $result
 }
 
 # --- Step 1: stop the services -------------------------------------------------
 Write-Host '=== Step 1/3: Stopping Windows Update services ==='
-foreach ($s in $wuServices) {
+foreach ($s in ($wuServices + $holderServices)) {
     Stop-WuService -Name $s.Name -Label $s.Label
 }
 
 # --- Step 2: delete the dead cache files ---------------------------------------
 Write-Host ''
 Write-Host '=== Step 2/3: Deleting dead cache files ==='
-$failedDeletes = 0
-$failedDeletes += Clear-FolderContents -Path (Join-Path $env:SystemRoot 'SoftwareDistribution\Download') -Label 'WU download cache'
-$failedDeletes += Clear-FolderContents -Path (Join-Path $env:SystemRoot 'System32\catroot2') -Label 'catroot2 (signature catalog cache)'
+$removedTotal = 0
+$queuedTotal  = 0
+$failedTotal  = 0
+$r = Clear-FolderContents -Path (Join-Path $env:SystemRoot 'SoftwareDistribution\Download') -Label 'WU download cache'
+$removedTotal += $r.Removed; $queuedTotal += $r.Queued; $failedTotal += $r.Failed
+$r = Clear-FolderContents -Path (Join-Path $env:SystemRoot 'System32\catroot2') -Label 'catroot2 (signature catalog cache)'
+$removedTotal += $r.Removed; $queuedTotal += $r.Queued; $failedTotal += $r.Failed
 
 # BITS queue files (qmgr*.dat)
 $downloaderPath = Join-Path $env:ProgramData 'Microsoft\Network\Downloader'
@@ -175,7 +224,8 @@ if (Test-Path -LiteralPath $downloaderPath) {
             Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
             $qRemoved++
         } catch {
-            $failedDeletes++   # counted silently; summarized at the end
+            $q = Register-DeleteOnReboot -Path $file.FullName
+            if ($q -gt 0) { $queuedTotal++ } else { $failedTotal++ }
         }
     }
     Write-Host "  BITS queue : removed $qRemoved qmgr file(s) from $downloaderPath"
@@ -188,11 +238,14 @@ foreach ($name in @('cryptsvc', 'bits', 'wuauserv')) {
     $entry = $wuServices | Where-Object { $_.Name -eq $name }
     Start-WuService -Name $entry.Name -Label $entry.Label
 }
+foreach ($s in $holderServices) {
+    Start-WuService -Name $s.Name -Label $s.Label
+}
 
 # --- Summary ---------------------------------------------------------------------
 Write-Host ''
 Write-Host 'Service status now:'
-foreach ($s in $wuServices) {
+foreach ($s in ($wuServices + $holderServices)) {
     $svc = Get-Service -Name $s.Name -ErrorAction SilentlyContinue
     if ($null -eq $svc) {
         Write-Host ("  {0,-10} : (not present)" -f $s.Name)
@@ -202,10 +255,16 @@ foreach ($s in $wuServices) {
 }
 
 Write-Host ''
-if ($failedDeletes -gt 0) {
-    Write-Host "$failedDeletes file(s)/folder(s) could not be deleted (still locked)." -ForegroundColor Yellow
-    Write-Host 'Restart the computer manually, then run this script once more to finish the cleanup.'
-} else {
+if ($queuedTotal -gt 0) {
+    Write-Host "$queuedTotal item(s) were still locked and are now queued for deletion at the next reboot." -ForegroundColor Yellow
+    Write-Host 'Restart the computer once: Windows deletes them early in the boot process, before the'
+    Write-Host 'update services start, so they cannot be locked again. After the restart, just open'
+    Write-Host 'Settings > Windows Update and check for updates - the caches rebuild themselves clean.'
+}
+if ($failedTotal -gt 0) {
+    Write-Host "$failedTotal item(s) could not be deleted or queued - check the service status above." -ForegroundColor Red
+}
+if ($queuedTotal -eq 0 -and $failedTotal -eq 0) {
     Write-Host 'Windows Update cache reset complete.' -ForegroundColor Green
     Write-Host 'Open Settings > Windows Update and check for updates again.'
 }
