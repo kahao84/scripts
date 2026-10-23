@@ -27,12 +27,20 @@
     The update history database (SoftwareDistribution\DataStore) is NOT
     touched, so the installed-update history stays intact.
 
+    Stopping is forceful and quiet: the stop request is sent without
+    waiting, and a service that has not stopped within a few seconds is
+    force-stopped by killing its own process (on Windows 10 / 11 these
+    services run in a dedicated svchost process). Warning output is kept
+    to a minimum - locked files are counted and reported as one summary
+    line at the end instead of one warning per file.
+
     The script NEVER restarts the computer. If some files were locked
     and could not be deleted, restart manually and run it once more.
 
 .NOTES
     Author  : Brian Lee (kahao84)
-    Version : 1.0 - 2026-10-23
+    Version : 1.1 - 2026-10-23 (force-stop services immediately;
+              minimized warning output)
     Requires: Windows 10 / 11, Windows PowerShell 5.1+,
               Administrator rights (re-launches itself elevated if needed).
 
@@ -71,19 +79,30 @@ function Stop-WuService {
         return
     }
     Write-Host "  Stopping $Label ($Name) ..."
-    try {
-        Stop-Service -Name $Name -Force -ErrorAction Stop
-    } catch {
-        Write-Host "    Stop failed: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-    # Give it up to ~20 seconds to actually reach Stopped.
+    # Send the stop request without waiting: sc.exe returns immediately and
+    # does not spam "Waiting for service..." warnings like Stop-Service does.
+    & "$env:SystemRoot\System32\sc.exe" stop $Name | Out-Null
+    # Short grace period (max ~5 seconds) for a clean stop.
     $svc = Get-Service -Name $Name
-    for ($i = 0; $i -lt 20 -and $svc.Status -ne 'Stopped'; $i++) {
+    for ($i = 0; $i -lt 5 -and $svc.Status -ne 'Stopped'; $i++) {
         Start-Sleep -Seconds 1
         $svc.Refresh()
     }
+    # Still not stopped? Force-kill the service's own process. On Windows
+    # 10 / 11 these services run in a dedicated svchost process, so this
+    # stops just this service.
     if ($svc.Status -ne 'Stopped') {
-        Write-Host "    WARNING: $Name is still $($svc.Status) - files it holds may be locked." -ForegroundColor Yellow
+        $procId = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue).ProcessId
+        if ($procId -and $procId -ne 0) {
+            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+            for ($i = 0; $i -lt 5 -and $svc.Status -ne 'Stopped'; $i++) {
+                Start-Sleep -Seconds 1
+                $svc.Refresh()
+            }
+        }
+    }
+    if ($svc.Status -ne 'Stopped') {
+        Write-Host "    WARNING: $Name could not be stopped (status: $($svc.Status)) - files it holds may stay locked." -ForegroundColor Yellow
     }
 }
 
@@ -102,7 +121,7 @@ function Start-WuService {
     }
     Write-Host "  Starting $Label ($Name) ..."
     try {
-        Start-Service -Name $Name -ErrorAction Stop
+        Start-Service -Name $Name -ErrorAction Stop -WarningAction SilentlyContinue
     } catch {
         Write-Host "    Start failed: $($_.Exception.Message)" -ForegroundColor Red
     }
@@ -126,8 +145,7 @@ function Clear-FolderContents {
             Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
             $removed++
         } catch {
-            $failed++
-            Write-Host "    Could not delete $($item.FullName) (still locked?)" -ForegroundColor Yellow
+            $failed++   # locked files are counted silently; one summary line at the end
         }
     }
     Write-Host "  $Label : removed $removed item(s) from $Path"
@@ -157,8 +175,7 @@ if (Test-Path -LiteralPath $downloaderPath) {
             Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
             $qRemoved++
         } catch {
-            $failedDeletes++
-            Write-Host "    Could not delete $($file.FullName) (still locked?)" -ForegroundColor Yellow
+            $failedDeletes++   # counted silently; summarized at the end
         }
     }
     Write-Host "  BITS queue : removed $qRemoved qmgr file(s) from $downloaderPath"
