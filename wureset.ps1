@@ -38,11 +38,16 @@
     line at the end instead of one warning per file.
 
     If a file or folder STILL cannot be deleted (locked by a protected
-    service or a stubborn handle), it is queued for deletion at the next
-    reboot instead (PendingFileRenameOperations): Windows deletes it
-    early in the boot process, before the update services start, so it
-    cannot be locked again. The summary at the end tells you when a
-    reboot is needed to finish the cleanup.
+    service or a stubborn handle), the script escalates: it takes
+    ownership of the item and grants Administrators full control, then
+    retries the delete. If it still survives, it is queued for deletion
+    at the next reboot (PendingFileRenameOperations - registered via
+    MoveFileEx, with a direct registry write as fallback): Windows
+    deletes it early in the boot process, before the update services
+    start, so it cannot be locked again. If even the registration
+    fails, the real Win32 error code is printed once so the cause can
+    be diagnosed instead of guessed. The summary at the end tells you
+    when a reboot is needed to finish the cleanup.
 
     The script NEVER restarts the computer. If files were queued for
     deletion at the next reboot, restart manually once - no need to run
@@ -50,9 +55,10 @@
 
 .NOTES
     Author  : Brian Lee (kahao84)
-    Version : 1.2 - 2026-10-23 (also stop TrustedInstaller / UsoSvc;
-              files that stay locked are queued for deletion at the
-              next reboot)
+    Version : 1.3 - 2026-10-24 (deletion escalates: take ownership and
+              retry, then queue for deletion at next reboot via API or
+              direct registry write; first failure prints the Win32
+              error code)
     Requires: Windows 10 / 11, Windows PowerShell 5.1+,
               Administrator rights (re-launches itself elevated if needed).
 
@@ -94,6 +100,26 @@ if (-not ([System.Management.Automation.PSTypeName]'Win32.MoveFile').Type) {
 '@
 }
 
+$queueErrorShown = $false
+
+function Add-PendingDeletePair {
+    # Fallback registration: append the (source, "") pair directly to the
+    # PendingFileRenameOperations registry value, in NT path form.
+    param([string]$Path)
+    try {
+        $smKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+        $existing = (Get-ItemProperty -Path $smKey -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        $pairs = @()
+        if ($existing) { $pairs += $existing }
+        $pairs += ("\??\" + $Path)
+        $pairs += ''
+        Set-ItemProperty -Path $smKey -Name 'PendingFileRenameOperations' -Value $pairs -Type MultiString -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Register-DeleteOnReboot {
     param([string]$Path)
     $queued = 0
@@ -103,7 +129,17 @@ function Register-DeleteOnReboot {
         }
     }
     # MOVEFILE_DELAY_UNTIL_REBOOT = 4; a null new name means "delete".
-    if ([Win32.MoveFile]::MoveFileEx($Path, $null, 4)) { $queued++ }
+    if ([Win32.MoveFile]::MoveFileEx($Path, $null, 4)) {
+        $queued++
+    } else {
+        $win32err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if (Add-PendingDeletePair -Path $Path) {
+            $queued++
+        } elseif (-not $script:queueErrorShown) {
+            $script:queueErrorShown = $true
+            Write-Host "    Note: queuing '$Path' for deletion at reboot failed (MoveFileEx Win32 error $win32err)." -ForegroundColor Yellow
+        }
+    }
     return $queued
 }
 
@@ -184,10 +220,22 @@ function Clear-FolderContents {
             Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
             $result.Removed++
         } catch {
-            # Still locked: queue it for deletion at the next reboot, when
-            # Windows removes it before the update services can start.
-            $q = Register-DeleteOnReboot -Path $item.FullName
-            if ($q -gt 0) { $result.Queued++ } else { $result.Failed++ }
+            # Escalate: take ownership + grant Administrators full control,
+            # then retry the delete once.
+            $deleted = $false
+            try {
+                & "$env:SystemRoot\System32\takeown.exe" /F $item.FullName /R /D Y | Out-Null
+                & "$env:SystemRoot\System32\icacls.exe" $item.FullName /grant '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
+                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+                $result.Removed++
+                $deleted = $true
+            } catch { }
+            if (-not $deleted) {
+                # Last resort: queue it for deletion at the next reboot,
+                # when Windows removes it before the services can start.
+                $q = Register-DeleteOnReboot -Path $item.FullName
+                if ($q -gt 0) { $result.Queued++ } else { $result.Failed++ }
+            }
         }
     }
     $line = "  $Label : removed $($result.Removed) item(s) from $Path"
