@@ -46,8 +46,12 @@
     deletes it early in the boot process, before the update services
     start, so it cannot be locked again. If even the registration
     fails, the real Win32 error code is printed once so the cause can
-    be diagnosed instead of guessed. The summary at the end tells you
-    when a reboot is needed to finish the cleanup.
+    be diagnosed instead of guessed. Deletion and registration use
+    extended-length (\\?\) calls, so the extra-deep staging folders
+    under SoftwareDistribution\Download - whose paths exceed the
+    classic 260-character limit and defeat normal delete calls - are
+    handled too. The summary at the end tells you when a reboot is
+    needed to finish the cleanup.
 
     The script NEVER restarts the computer. If files were queued for
     deletion at the next reboot, restart manually once - no need to run
@@ -55,10 +59,9 @@
 
 .NOTES
     Author  : Brian Lee (kahao84)
-    Version : 1.3 - 2026-10-24 (deletion escalates: take ownership and
-              retry, then queue for deletion at next reboot via API or
-              direct registry write; first failure prints the Win32
-              error code)
+    Version : 1.4 - 2026-10-24 (long-path-proof deletion via .NET
+              extended-length calls; takeown/icacls output silenced;
+              reboot-queue registration uses \\?\ paths)
     Requires: Windows 10 / 11, Windows PowerShell 5.1+,
               Administrator rights (re-launches itself elevated if needed).
 
@@ -124,12 +127,18 @@ function Register-DeleteOnReboot {
     param([string]$Path)
     $queued = 0
     if (Test-Path -LiteralPath $Path -PathType Container) {
-        foreach ($child in Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue) {
-            $queued += Register-DeleteOnReboot -Path $child.FullName
-        }
+        # Enumerate via .NET with the \\?\ prefix: Get-ChildItem cannot
+        # reach entries whose full path exceeds 260 characters.
+        try {
+            foreach ($childLong in [System.IO.Directory]::EnumerateFileSystemEntries("\\?\$Path")) {
+                $child = $childLong -replace '^\\\\\?\\', ''
+                $queued += Register-DeleteOnReboot -Path $child
+            }
+        } catch { }
     }
     # MOVEFILE_DELAY_UNTIL_REBOOT = 4; a null new name means "delete".
-    if ([Win32.MoveFile]::MoveFileEx($Path, $null, 4)) {
+    # The \\?\ prefix keeps paths longer than 260 characters registerable.
+    if ([Win32.MoveFile]::MoveFileEx("\\?\$Path", $null, 4)) {
         $queued++
     } else {
         $win32err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
@@ -141,6 +150,41 @@ function Register-DeleteOnReboot {
         }
     }
     return $queued
+}
+
+function Remove-ItemDeep {
+    # One forced delete of a file or folder, escalating through:
+    #   1. plain Remove-Item
+    #   2. .NET delete via the \\?\ extended-length path (defeats the
+    #      260-character limit), after clearing read-only attributes
+    #   3. take ownership + grant Administrators full control (both
+    #      tools silenced), then Remove-Item once more
+    # Returns $true when the item is gone.
+    param([string]$Path)
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        return $true
+    } catch { }
+    try {
+        $long = "\\?\$Path"
+        if (Test-Path -LiteralPath $Path -PathType Container) {
+            foreach ($f in [System.IO.Directory]::EnumerateFiles($long, '*', [System.IO.SearchOption]::AllDirectories)) {
+                [System.IO.File]::SetAttributes($f, [System.IO.FileAttributes]::Normal)
+            }
+            [System.IO.Directory]::Delete($long, $true)
+        } else {
+            [System.IO.File]::SetAttributes($long, [System.IO.FileAttributes]::Normal)
+            [System.IO.File]::Delete($long)
+        }
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    } catch { }
+    try {
+        & "$env:SystemRoot\System32\takeown.exe" /F $Path /R /D Y 2>$null | Out-Null
+        & "$env:SystemRoot\System32\icacls.exe" $Path /grant '*S-1-5-32-544:(OI)(CI)F' /T /C /Q 2>$null | Out-Null
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        return $true
+    } catch { }
+    return $false
 }
 
 function Stop-WuService {
@@ -216,26 +260,13 @@ function Clear-FolderContents {
         return $result
     }
     foreach ($item in $items) {
-        try {
-            Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+        if (Remove-ItemDeep -Path $item.FullName) {
             $result.Removed++
-        } catch {
-            # Escalate: take ownership + grant Administrators full control,
-            # then retry the delete once.
-            $deleted = $false
-            try {
-                & "$env:SystemRoot\System32\takeown.exe" /F $item.FullName /R /D Y | Out-Null
-                & "$env:SystemRoot\System32\icacls.exe" $item.FullName /grant '*S-1-5-32-544:(OI)(CI)F' /T /C /Q | Out-Null
-                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
-                $result.Removed++
-                $deleted = $true
-            } catch { }
-            if (-not $deleted) {
-                # Last resort: queue it for deletion at the next reboot,
-                # when Windows removes it before the services can start.
-                $q = Register-DeleteOnReboot -Path $item.FullName
-                if ($q -gt 0) { $result.Queued++ } else { $result.Failed++ }
-            }
+        } else {
+            # Last resort: queue it for deletion at the next reboot,
+            # when Windows removes it before the services can start.
+            $q = Register-DeleteOnReboot -Path $item.FullName
+            if ($q -gt 0) { $result.Queued++ } else { $result.Failed++ }
         }
     }
     $line = "  $Label : removed $($result.Removed) item(s) from $Path"
